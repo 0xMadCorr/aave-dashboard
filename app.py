@@ -416,12 +416,166 @@ def max_borrow_for_loop(collateral, debt, fresh_cash, liq_threshold, ltv, target
     return max(0.0, min(hf_cap, ltv_cap))
 
 
-def liq_price(price, collateral, debt, liq_threshold):
-    """Approx. price of the collateral asset at which Health Factor reaches 1.
-    Assumes ALL collateral is that one asset and the debt is a stablecoin."""
-    if not price or debt <= 0 or collateral <= 0 or liq_threshold <= 0:
+# ============================================================
+# WALLET ASSET BREAKDOWN (which assets are supplied / borrowed on AAVE)
+# Addresses/signatures checked against bgd-labs/aave-address-book and aave-v3-origin.
+# ============================================================
+AAVE_BASE_ADDRESSES_PROVIDER = "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D"
+STABLE_SYMBOLS = {"USDC", "USDBC", "USDT", "DAI", "GHO", "USDS", "SUSDS", "EURC", "LUSD", "CRVUSD"}
+
+
+def _selector(signature):
+    from web3 import Web3
+    return "0x" + bytes(Web3.keccak(text=signature)[:4]).hex()
+
+
+def _addr_word(addr):
+    return addr.lower().replace("0x", "").rjust(64, "0")
+
+
+def _word(hexstr, i):
+    return hexstr[2:][64 * i: 64 * (i + 1)]
+
+
+def _word_addr(hexstr, i):
+    return "0x" + _word(hexstr, i)[-40:]
+
+
+def _rpc_calls(rpc_url, calls):
+    """Run many read-only eth_calls. Uses one batched HTTP request per 40 calls;
+    falls back to one-by-one if the RPC does not accept batches.
+    calls = [(to_address, data_hex)] -> list of hex results (None where a call failed)."""
+    import requests
+    out = [None] * len(calls)
+    for start in range(0, len(calls), 40):
+        chunk = calls[start:start + 40]
+        payload = [
+            {"jsonrpc": "2.0", "id": start + i, "method": "eth_call",
+             "params": [{"to": to, "data": data}, "latest"]}
+            for i, (to, data) in enumerate(chunk)
+        ]
+        done = False
+        try:
+            res = requests.post(rpc_url, json=payload, timeout=20).json()
+            if isinstance(res, list):
+                for item in res:
+                    if isinstance(item, dict) and item.get("result") not in (None, "0x"):
+                        out[int(item["id"])] = item["result"]
+                done = True
+        except Exception:
+            pass
+        if not done:
+            for i, (to, data) in enumerate(chunk):
+                try:
+                    j = requests.post(
+                        rpc_url,
+                        json={"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                              "params": [{"to": to, "data": data}, "latest"]},
+                        timeout=20,
+                    ).json()
+                    if j.get("result") not in (None, "0x"):
+                        out[start + i] = j["result"]
+                except Exception:
+                    pass
+    return out
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_aave_breakdown(wallet_address: str, rpc_url: str):
+    """Per-asset supplied / borrowed amounts and USD values for a wallet on AAVE v3 Base.
+    Returns {"positions": [...], "error": None} or {"error": "..."}."""
+    try:
+        from web3 import Web3
+        from eth_abi import decode, encode
+    except ImportError:
+        return {"error": "The 'web3' package is not installed."}
+    try:
+        user = Web3.to_checksum_address(wallet_address)
+        r = _rpc_calls(rpc_url, [
+            (AAVE_BASE_ADDRESSES_PROVIDER, _selector("getPoolDataProvider()")),
+            (AAVE_BASE_ADDRESSES_PROVIDER, _selector("getPriceOracle()")),
+        ])
+        if r[0] is None or r[1] is None:
+            return {"error": "could not read AAVE's address provider from the RPC"}
+        data_provider, oracle = _word_addr(r[0], 0), _word_addr(r[1], 0)
+
+        res = _rpc_calls(rpc_url, [(data_provider, _selector("getAllReservesTokens()"))])[0]
+        if res is None:
+            return {"error": "could not read the list of AAVE assets"}
+        reserves = decode(["(string,address)[]"], bytes.fromhex(res[2:]))[0]
+        symbols = [s for s, _ in reserves]
+        assets = [a for _, a in reserves]
+
+        price_call = _selector("getAssetsPrices(address[])") + encode(["address[]"], [assets]).hex()
+        calls = [(oracle, price_call)]
+        for a in assets:
+            calls.append((data_provider, _selector("getReserveTokensAddresses(address)") + _addr_word(a)))
+            calls.append((a, _selector("decimals()")))
+        out = _rpc_calls(rpc_url, calls)
+        if out[0] is None:
+            return {"error": "could not read asset prices"}
+        prices = decode(["uint256[]"], bytes.fromhex(out[0][2:]))[0]
+
+        meta = []
+        for i, a in enumerate(assets):
+            tok, dec = out[1 + 2 * i], out[2 + 2 * i]
+            if tok is None or dec is None:
+                continue
+            meta.append({
+                "symbol": symbols[i], "address": a, "price": prices[i] / 1e8,
+                "decimals": int(_word(dec, 0), 16),
+                "a_token": _word_addr(tok, 0), "debt_token": _word_addr(tok, 2),
+            })
+        if not meta:
+            return {"error": "no AAVE assets could be read"}
+
+        bal = _selector("balanceOf(address)") + _addr_word(user)
+        calls2 = []
+        for m in meta:
+            calls2.append((m["a_token"], bal))
+            calls2.append((m["debt_token"], bal))
+        out2 = _rpc_calls(rpc_url, calls2)
+
+        positions = []
+        for i, m in enumerate(meta):
+            a_raw, d_raw = out2[2 * i], out2[2 * i + 1]
+            if a_raw is None or d_raw is None:
+                continue
+            supplied = int(_word(a_raw, 0), 16) / 10 ** m["decimals"]
+            debt = int(_word(d_raw, 0), 16) / 10 ** m["decimals"]
+            if supplied <= 0 and debt <= 0:
+                continue
+            positions.append({
+                "symbol": m["symbol"], "address": m["address"], "price": m["price"],
+                "supplied": supplied, "supplied_usd": supplied * m["price"],
+                "debt": debt, "debt_usd": debt * m["price"],
+                "is_stable": m["symbol"].upper() in STABLE_SYMBOLS,
+            })
+        return {"positions": positions, "error": None}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def liq_price(main_price, vol_value, stable_value, debt, lt):
+    """Approx. price of the main collateral asset at which Health Factor reaches 1.
+    Assumes all non-stablecoin collateral moves together with the main asset,
+    stablecoin collateral stays flat, and the debt is a stablecoin."""
+    if not main_price or debt <= 0 or lt <= 0:
         return None
-    return price * debt / (collateral * liq_threshold)
+    if vol_value <= 0:
+        return 0.0
+    factor = (debt / lt - stable_value) / vol_value
+    return main_price * max(factor, 0.0)
+
+
+def liq_text(value, debt):
+    if debt <= 0:
+        return "None (no debt)"
+    if value is None:
+        return "N/A"
+    if value <= 0:
+        return "None (stablecoins cover debt)"
+    return f"${value:,.0f}"
 
 
 def money(x, none_text="N/A"):
@@ -434,15 +588,16 @@ def money(x, none_text="N/A"):
 top_l, top_r = st.columns([6, 1])
 top_l.title("Crypto Leverage (AAVE - Base)")
 if top_r.button("↻ Refresh", key="refresh_v2"):
-    fetch_aave_account_data.clear(); fetch_crypto_technicals.clear()
+    fetch_aave_account_data.clear(); fetch_aave_breakdown.clear(); fetch_crypto_technicals.clear()
     fetch_weekly_chart_data.clear(); fetch_btc_probability_history.clear()
     st.rerun()
 st.caption(
     "Informational tool only. Not financial advice. Leverage can lead to total loss and liquidation. "
-    "Your wallet address is only used for a read-only lookup and is not stored."
+    "Your wallet address is only used for a read-only lookup and is not stored. "
+    "Light/dark mode: ⋮ menu (top right) → Settings → Theme."
 )
 
-# ---------- market data (needed for prices / liquidation levels) ----------
+# ---------- market data ----------
 with st.spinner("Loading market data..."):
     btc = fetch_crypto_technicals("BTC-USD")
     eth = fetch_crypto_technicals("ETH-USD")
@@ -482,26 +637,53 @@ if st.button("Fetch AAVE position", type="primary", key="fetch_aave_v2"):
     else:
         with st.spinner("Reading AAVE position..."):
             aave_result = fetch_aave_account_data(wallet_address, rpc_url)
+            if aave_result.get("error"):
+                st.session_state["cl_aave"] = None
+                st.session_state["cl_breakdown"] = None
+            else:
+                st.session_state["cl_aave"] = aave_result
+                st.session_state["cl_breakdown"] = fetch_aave_breakdown(wallet_address, rpc_url)
         if aave_result.get("error"):
-            st.session_state["cl_aave"] = None
             st.error(f"Could not fetch AAVE data: {aave_result['error']}")
         else:
-            st.session_state["cl_aave"] = aave_result
             st.rerun()
 
 cached_aave = st.session_state.get("cl_aave")
 position_loaded = bool(cached_aave and not cached_aave.get("error"))
+breakdown = st.session_state.get("cl_breakdown") if position_loaded else None
+breakdown_ok = bool(breakdown and not breakdown.get("error"))
+positions = breakdown["positions"] if breakdown_ok else []
+if position_loaded and breakdown and breakdown.get("error"):
+    st.warning(f"Could not read your individual assets ({breakdown['error']}). Choose the collateral asset manually below.")
 
-coll_asset = st.radio(
-    "Main collateral asset (used for the liquidation price)", ["BTC", "ETH"],
-    horizontal=True, key="coll_asset_v2",
-)
-asset_price = btc_price if coll_asset == "BTC" else eth.get("price")
+pos_collateral = cached_aave["total_collateral"] if position_loaded else 0.0
+pos_debt = cached_aave["total_debt"] if position_loaded else 0.0
+supplied_total = sum(p["supplied_usd"] for p in positions)
+volatile_supplied = [p for p in positions if not p["is_stable"] and p["supplied_usd"] > 0]
+auto_ok = position_loaded and pos_collateral > 0 and supplied_total > 0 and bool(volatile_supplied)
+
+# --- main collateral asset: detected from the wallet, manual BTC/ETH only as a fallback ---
+if auto_ok:
+    main = max(volatile_supplied, key=lambda p: p["supplied_usd"])
+    main_symbol, asset_price = main["symbol"], main["price"]
+    vol_share = sum(p["supplied_usd"] for p in volatile_supplied) / supplied_total
+    vol_value = pos_collateral * vol_share
+    stable_value = pos_collateral - vol_value
+else:
+    stable_only = bool(position_loaded and breakdown_ok and positions and not volatile_supplied)
+    if not position_loaded:
+        label = "Asset you plan to buy / hold as collateral"
+    elif stable_only:
+        label = "Your collateral is all stablecoins. Asset you plan to buy"
+    else:
+        label = "Collateral asset (could not be detected from your wallet)"
+    main_symbol = st.radio(label, ["BTC", "ETH"], horizontal=True, key="coll_asset_v2")
+    asset_price = btc_price if main_symbol == "BTC" else eth.get("price")
+    vol_value = 0.0 if stable_only else pos_collateral
+    stable_value = pos_collateral if stable_only else 0.0
 
 stress_box = None
 if position_loaded:
-    pos_collateral = cached_aave["total_collateral"]
-    pos_debt = cached_aave["total_debt"]
     pos_hf = cached_aave["health_factor"]
     pos_lt = cached_aave["liq_threshold_pct"] / 100.0
     drop_to_liq = (
@@ -515,13 +697,34 @@ if position_loaded:
     a4.metric("Health Factor", "∞" if pos_debt == 0 else f"{pos_hf:.2f}")
     a5.metric("Liquidation buffer", f"{drop_to_liq:.1f}%")
     a6.metric(
-        f"Liquidation price ({coll_asset})",
-        money(liq_price(asset_price, pos_collateral, pos_debt, pos_lt), "None (no debt)"),
+        f"Liquidation price ({main_symbol})",
+        liq_text(liq_price(asset_price, vol_value, stable_value, pos_debt, pos_lt), pos_debt),
     )
-    st.caption(
-        f"Liquidation price is an estimate: it assumes all your collateral is {coll_asset} and your debt is a stablecoin. "
-        f"If you hold a mix of assets, the real level will differ."
-    )
+
+    if positions:
+        rows = []
+        for p in sorted(positions, key=lambda p: -(p["supplied_usd"] + p["debt_usd"])):
+            rows.append({
+                "Asset": p["symbol"],
+                "Supplied": f"{p['supplied']:,.4f}".rstrip("0").rstrip(".") if p["supplied"] else "-",
+                "Supplied value": money(p["supplied_usd"]) if p["supplied"] else "-",
+                "Share of supplied": f"{p['supplied_usd'] / supplied_total * 100:.0f}%" if supplied_total and p["supplied"] else "-",
+                "Borrowed value": money(p["debt_usd"]) if p["debt"] else "-",
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        if auto_ok:
+            st.caption(
+                f"**Main collateral asset detected: {main_symbol}** (your largest non-stablecoin collateral). "
+                "Liquidation price is an estimate: all your non-stablecoin collateral is assumed to fall together, "
+                "stablecoin collateral stays flat, and the debt is treated as a stablecoin."
+            )
+        if supplied_total > pos_collateral * 1.03 > 0:
+            st.caption(
+                "Some supplied assets may not be enabled as collateral on AAVE, so the shares above are scaled to AAVE's collateral total."
+            )
+        volatile_debt = sum(p["debt_usd"] for p in positions if not p["is_stable"])
+        if pos_debt > 0 and volatile_debt > 0.05 * pos_debt:
+            st.warning("You also borrow a non-stablecoin asset. Its price moves are not included in the liquidation estimate.")
     stress_box = st.container()
 else:
     st.caption("Enter your wallet address and press **Fetch AAVE position**.")
@@ -534,8 +737,8 @@ i1, i2 = st.columns(2)
 invest = i1.number_input("Amount to invest this month ($)", min_value=0.0, value=0.0, step=100.0, key="invest_v2")
 hf_keep = i2.number_input("Health factor to keep", min_value=1.1, max_value=5.0, value=1.8, step=0.1, key="hf_keep_v2")
 
-if position_loaded and cached_aave["total_collateral"] > 0:
-    C, D = cached_aave["total_collateral"], cached_aave["total_debt"]
+if position_loaded and pos_collateral > 0:
+    C, D = pos_collateral, pos_debt
     L, V = cached_aave["liq_threshold_pct"] / 100.0, cached_aave["ltv_pct"] / 100.0
     assumed = False
 else:
@@ -549,28 +752,29 @@ else:
     C, D = 0.0, 0.0
     assumed = True
 
-C2, D2, loop_done = C, D, False
+C2, D2, vol2, loop_done = C, D, vol_value, False
 if C + invest <= 0:
     st.caption("Enter the amount you plan to invest to see the safe loop.")
 else:
     max_b = max_borrow_for_loop(C, D, invest, L, V, hf_keep)
-    C2, D2, loop_done = C + invest + max_b, D + max_b, True
+    vol2 = vol_value + invest + max_b          # new purchases go into the main asset
+    C2, D2, loop_done = stable_value + vol2, D + max_b, True
     hf_after = float("inf") if D2 <= 0 else C2 * L / D2
     ltv_after = D2 / C2 if C2 > 0 else 0.0
-    liq_now = liq_price(asset_price, C, D, L)
-    liq_after = liq_price(asset_price, C2, D2, L)
+    liq_now = liq_price(asset_price, vol_value, stable_value, D, L)
+    liq_after = liq_price(asset_price, vol2, stable_value, D2, L)
 
     r1, r2, r3, r4, r5 = st.columns(5)
     r1.metric("Safe borrow", f"${max_b:,.0f}")
-    r2.metric(f"Total {coll_asset} to buy", f"${invest + max_b:,.0f}")
+    r2.metric(f"Total {main_symbol} to buy", f"${invest + max_b:,.0f}")
     r3.metric("Collateral after", f"${C2:,.0f}")
     r4.metric("Debt after", f"${D2:,.0f}")
     r5.metric("Health Factor after", "∞" if hf_after == float("inf") else f"{hf_after:.2f}")
 
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric(f"{coll_asset} price now", money(asset_price))
-    s2.metric("Liquidation price now", money(liq_now, "None (no debt)"))
-    s3.metric("Liquidation price after loop", money(liq_after, "None (no debt)"))
+    s1.metric(f"{main_symbol} price now", money(asset_price))
+    s2.metric("Liquidation price now", liq_text(liq_now, D))
+    s3.metric("Liquidation price after loop", liq_text(liq_after, D2))
     s4.metric("LTV after", f"{ltv_after*100:.1f}%")
 
     if D > 0 and C * L / D < hf_keep and max_b <= 0:
@@ -580,8 +784,8 @@ else:
         )
     elif max_b > 0:
         st.markdown(
-            f"**How to do it:** buy **${invest:,.0f} {coll_asset}** and supply it → borrow **${max_b:,.0f}** (stablecoin) → "
-            f"buy more {coll_asset} with it → supply that too. You can borrow in several rounds if you prefer; "
+            f"**How to do it:** buy **${invest:,.0f} {main_symbol}** and supply it → borrow **${max_b:,.0f}** (stablecoin) → "
+            f"buy more {main_symbol} with it → supply that too. You can borrow in several rounds if you prefer; "
             f"the end result is the same. Your Health Factor ends at about **{hf_after:.2f}**."
         )
     else:
@@ -606,24 +810,24 @@ else:
 # ---------- collateral drop stress test (rendered up in the position section) ----------
 if stress_box is not None and (D > 0 or D2 > 0):
     with stress_box:
-        st.markdown("**Collateral drop stress test**")
+        st.markdown("**Collateral drop stress test** (non-stablecoin collateral falls, stablecoins stay flat)")
         rows = []
         for drop in [10, 20, 30, 50]:
             f = 1 - drop / 100.0
-            hf_n = (C * f * L) / D if D > 0 else None
+            hf_n = ((vol_value * f + stable_value) * L) / D if D > 0 else None
             row = {
                 "Collateral drop": f"-{drop}%",
-                f"{coll_asset} price": money(asset_price * f) if asset_price else "N/A",
+                f"{main_symbol} price": money(asset_price * f) if asset_price else "N/A",
                 "HF now": f"{hf_n:.2f}" if hf_n is not None else "∞",
             }
             last_hf = hf_n
             if loop_done:
-                hf_a = (C2 * f * L) / D2 if D2 > 0 else None
+                hf_a = ((vol2 * f + stable_value) * L) / D2 if D2 > 0 else None
                 row["HF after loop"] = f"{hf_a:.2f}" if hf_a is not None else "∞"
                 last_hf = hf_a
             row["Status"] = "LIQUIDATION RISK" if (last_hf is not None and last_hf < 1.0) else "SAFE"
             rows.append(row)
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 # ============================================================
 # 3. MARKET OVERVIEW
@@ -653,7 +857,7 @@ else:
     st.info(recommendation)
 
 # ============================================================
-# 4. WEEKLY PRICE ACTION
+# 4. WEEKLY PRICE ACTION  (no fixed colour template, so it follows light/dark mode)
 # ============================================================
 st.header("Weekly price action")
 chart_symbol = st.radio("Chart", ["BTC", "ETH"], horizontal=True, key="chart_symbol_v2")
@@ -665,8 +869,8 @@ if chart_df is not None and not chart_df.empty:
     fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["EMA200W"], name="200W EMA", line=dict(width=1, dash="dot")))
     fig.update_layout(
         height=300, margin=dict(l=5, r=5, t=10, b=5), yaxis_title="USD",
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1), template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
     )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 else:
     st.caption("Chart data is not available right now.")
